@@ -1,0 +1,57 @@
+version: '3'
+
+# Native macOS main window: SwiftUI with Liquid Glass, no WebView, no Wails
+# runtime. A standalone binary that talks to the Go process over the loopback
+# API (services/api.go); the Go side launches it from the tray and passes
+# --port. Bundled as Contents/Helpers/ScreenpearUI.app by darwin:package.
+#
+# Build:  task macos-swiftui:build
+# Run:    task macos-swiftui:run PORT=49405   (against a running Go app)
+
+vars:
+  SWIFTUI_MACOS_BIN: 'ScreenpearUI'
+  SWIFTUI_MACOS_MIN: '14.0'
+  SWIFTUI_MACOS_TARGET: '{{ARCH | replace "amd64" "x86_64"}}-apple-macos{{.SWIFTUI_MACOS_MIN}}'
+  SWIFT_SOURCES: 'build/swift-shared/*.swift build/macos-swiftui/swift/*.swift'
+
+tasks:
+  build:
+    summary: |
+      Compile the SwiftUI main window for macOS. Liquid Glass renders on
+      macOS 26+ when built with a macOS 26 SDK; older SDKs compile out the
+      glass branch (#if compiler(>=6.2) / #available) and the window falls
+      back to NSVisualEffectView materials.
+    platforms: [darwin]
+    sources:
+      - build/swift-shared/*.swift
+      - build/macos-swiftui/swift/*.swift
+    generates:
+      - '{{.BIN_DIR}}/{{.SWIFTUI_MACOS_BIN}}'
+    vars:
+      SDK_PATH:
+        sh: xcrun --sdk macosx --show-sdk-path
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - |
+        xcrun swiftc \
+          -target {{.SWIFTUI_MACOS_TARGET}} \
+          -sdk "{{.SDK_PATH}}" \
+          -parse-as-library \
+          -swift-version 5 \
+          {{if eq .PRODUCTION "true"}}-O{{else}}-Onone -g{{end}} \
+          -o "{{.BIN_DIR}}/{{.SWIFTUI_MACOS_BIN}}" \
+          {{.SWIFT_SOURCES}} \
+          -framework AppKit -framework SwiftUI -framework CoreText -framework UniformTypeIdentifiers
+
+  run:
+    summary: Build and launch the window against a running Go app (PORT=...)
+    platforms: [darwin]
+    deps: [build]
+    vars:
+      PORT: '{{.PORT | default "0"}}'
+    cmds:
+      - '{{.BIN_DIR}}/{{.SWIFTUI_MACOS_BIN}} --port {{.PORT}}'
+
+  clean:
+    cmds:
+      - rm -f '{{.BIN_DIR}}/{{.SWIFTUI_MACOS_BIN}}'

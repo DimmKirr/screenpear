@@ -1,0 +1,494 @@
+version: '3'
+
+# Native iOS lane: SwiftUI only. No Go, no Vite, no Wails runtime: iOS cannot
+# load a downloaded ONNX Runtime, so go-textshot does not apply here. OCR is
+# Apple Vision by default; the PP-OCRv6 models can be fetched on consent
+# (ModelStore.swift) for the PP-OCR engine once ONNX Runtime is linked.
+#
+#   task ios:dev                        # build, install and launch in the simulator
+#   task ios:iphone                     # deploy to the connected iPhone (auto-discovers everything, remembers it)
+#   task ios:xcode                      # generate build/ios-swiftui/xcode/Screenpear.xcodeproj and open it
+#   task ios:devices                    # list connected iPhones (UDIDs)
+#   task ios:device UDID=… TEAM_ID=… CODESIGN_IDENTITY="Apple Development: …" \
+#        PROFILE=~/Downloads/Screenpear_Dev.mobileprovision   # install + launch on a phone
+#
+# Every var is SWIFTUI_IOS_-prefixed: Task hoists sibling taskfiles' globals
+# into this scope, so an unprefixed name could silently take the macOS lane's
+# value.
+vars:
+  SWIFTUI_IOS_PLATFORM: '{{.SWIFTUI_IOS_PLATFORM | default "simulator"}}'
+  # 17: @Observable, ContentUnavailableView, PhotosPicker transferables.
+  SWIFTUI_MIN_IOS: '{{.SWIFTUI_MIN_IOS | default "17.0"}}'
+  SWIFTUI_IOS_SDK: '{{if eq .SWIFTUI_IOS_PLATFORM "device"}}iphoneos{{else}}iphonesimulator{{end}}'
+  SWIFTUI_IOS_TARGET: 'arm64-apple-ios{{.SWIFTUI_MIN_IOS}}{{if ne .SWIFTUI_IOS_PLATFORM "device"}}-simulator{{end}}'
+  CODESIGN_IDENTITY: '{{.CODESIGN_IDENTITY | default "-"}}'
+  SWIFTUI_IOS_BIN: 'screenpear'
+  SWIFTUI_IOS_APP: '{{.BIN_DIR}}/Screenpear-iOS.app'
+  SWIFTUI_IOS_SOURCES: 'build/swift-shared/*.swift build/ios-swiftui/swift/*.swift'
+
+tasks:
+  build:
+    summary: Compile and link the iOS app in one swiftc invocation (-parse-as-library so @main is honoured)
+    # Platform in the label on purpose: Task fingerprints sources/generates
+    # only, so without it a simulator build would satisfy a device build.
+    label: 'ios:build ({{.SWIFTUI_IOS_PLATFORM}})'
+    platforms: [darwin]
+    sources:
+      - build/swift-shared/*.swift
+      - build/ios-swiftui/swift/*.swift
+    generates:
+      - '{{.BIN_DIR}}/{{.SWIFTUI_IOS_BIN}}'
+    vars:
+      SDK_PATH:
+        sh: xcrun --sdk {{.SWIFTUI_IOS_SDK}} --show-sdk-path
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - |
+        xcrun -sdk {{.SWIFTUI_IOS_SDK}} swiftc \
+          -target {{.SWIFTUI_IOS_TARGET}} \
+          -sdk "{{.SDK_PATH}}" \
+          -parse-as-library \
+          -swift-version 5 \
+          {{if eq .PRODUCTION "true"}}-O{{else}}-Onone -g{{end}} \
+          -o "{{.BIN_DIR}}/{{.SWIFTUI_IOS_BIN}}" \
+          {{.SWIFTUI_IOS_SOURCES}} \
+          -framework Foundation -framework UIKit -framework SwiftUI \
+          -framework Vision -framework PhotosUI -framework CoreText
+
+  bundle:
+    summary: Assemble and sign the .app (icon via actool, partial plist merged back)
+    platforms: [darwin]
+    deps:
+      - task: build
+        vars:
+          SWIFTUI_IOS_PLATFORM: '{{.SWIFTUI_IOS_PLATFORM}}'
+          SWIFTUI_IOS_SDK: '{{.SWIFTUI_IOS_SDK}}'
+          SWIFTUI_IOS_TARGET: '{{.SWIFTUI_IOS_TARGET}}'
+    cmds:
+      - rm -rf "{{.SWIFTUI_IOS_APP}}"
+      - mkdir -p "{{.SWIFTUI_IOS_APP}}"
+      - cp "{{.BIN_DIR}}/{{.SWIFTUI_IOS_BIN}}" "{{.SWIFTUI_IOS_APP}}/{{.SWIFTUI_IOS_BIN}}"
+      - cp build/ios-swiftui/Info.plist "{{.SWIFTUI_IOS_APP}}/Info.plist"
+      - |
+        APP="{{.SWIFTUI_IOS_APP}}"
+        TMP_AC=$(mktemp -d)
+        xcrun actool \
+          --compile "$TMP_AC" \
+          --app-icon AppIcon \
+          --platform {{.SWIFTUI_IOS_SDK}} \
+          --minimum-deployment-target {{.SWIFTUI_MIN_IOS}} \
+          --product-type com.apple.product-type.application \
+          --target-device iphone --target-device ipad \
+          --output-partial-info-plist "$TMP_AC/assetcatalog_generated_info.plist" \
+          build/ios-swiftui/Assets.xcassets
+        [ -f "$TMP_AC/Assets.car" ] && cp -f "$TMP_AC/Assets.car" "$APP/Assets.car"
+        [ -f "$TMP_AC/assetcatalog_generated_info.plist" ] && \
+          /usr/libexec/PlistBuddy -c "Merge $TMP_AC/assetcatalog_generated_info.plist" "$APP/Info.plist"
+        rm -rf "$TMP_AC"
+      # Signing last: it seals the bundle.
+      - codesign --force --sign "{{.CODESIGN_IDENTITY}}" "{{.SWIFTUI_IOS_APP}}"
+
+  dev:
+    summary: Build, install and launch in the booted simulator
+    platforms: [darwin]
+    deps:
+      - task: ensure-simulator
+      - task: bundle
+    cmds:
+      - |
+        APP="{{.SWIFTUI_IOS_APP}}"
+        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+        xcrun simctl terminate booted "$BUNDLE_ID" 2>/dev/null || true
+        xcrun simctl install booted "$APP"
+        xcrun simctl launch booted "$BUNDLE_ID"
+
+  ensure-simulator:
+    internal: true
+    silent: true
+    platforms: [darwin]
+    cmds:
+      - |
+        if xcrun simctl list devices booted | grep -q "Booted"; then exit 0; fi
+        DEVICE_ID=$(xcrun simctl list devices available | grep "iPhone" | head -1 | grep -o "[A-F0-9-]\{36\}" || true)
+        if [ -z "$DEVICE_ID" ]; then
+          RUNTIME=$(xcrun simctl list runtimes | grep iOS | tail -1 | awk '{print $NF}')
+          DEVICE_TYPE=$(xcrun simctl list devicetypes | grep -oE "iPhone [0-9][^(]*" | tail -1 | xargs)
+          DEVICE_ID=$(xcrun simctl create "Screenpear iPhone" "${DEVICE_TYPE:-iPhone 16}" "$RUNTIME")
+        fi
+        xcrun simctl boot "$DEVICE_ID" 2>/dev/null || true
+        open -a Simulator
+        for i in $(seq 1 30); do xcrun simctl list devices booted | grep -q "Booted" && break; sleep 1; done
+        xcrun simctl list devices booted | grep -q "Booted" || { echo "Simulator failed to boot"; exit 1; }
+    preconditions:
+      - sh: command -v xcrun
+        msg: 'xcrun not found: install Xcode (command-line tools alone are not enough)'
+
+  iphone:
+    summary: |
+      Deploy to the physical iPhone that is connected right now.
+
+      Uses xcodebuild with automatic signing (no manual provisioning profile
+      hunt). Discovers the UDID of the first connected iPhone and the team
+      from the Xcode project, builds, installs and launches.
+
+      One-time setup: open the Xcode project (task ios:xcode), sign in to
+      your Apple account in Xcode > Settings > Accounts, and run once on
+      the phone so Xcode creates the managed signing assets.
+    platforms: [darwin]
+    cmds:
+      - |
+        set -euo pipefail
+        UDID="{{.UDID}}"
+        if [ -z "$UDID" ]; then
+          UDID=$(xcrun xcdevice list 2>/dev/null | python3 -c 'import json,sys; d=[x for x in json.load(sys.stdin) if not x.get("simulator") and x.get("platform")=="com.apple.platform.iphoneos"]; print(d[0]["identifier"] if d else "")')
+          [ -n "$UDID" ] || { echo "No iPhone connected (USB or paired Wi-Fi). Plug it in, unlock it, trust this Mac."; exit 1; }
+        fi
+
+        XCPROJ="build/ios-swiftui/xcode/Screenpear.xcodeproj"
+        if [ ! -d "$XCPROJ" ]; then
+          echo "Xcode project not found. Run: task ios:xcode"
+          exit 1
+        fi
+
+        TEAM="{{.TEAM_ID}}"
+        if [ -z "$TEAM" ]; then
+          TEAM=$(sed -n 's/.*DEVELOPMENT_TEAM *= *"\{0,1\}\([A-Z0-9]\{10\}\)"\{0,1\}.*/\1/p' "$XCPROJ/project.pbxproj" | head -1)
+        fi
+
+        printf 'UDID=%s\nTEAM_ID=%s\n' "$UDID" "$TEAM" > .ios-device.env
+        echo "iPhone: $UDID  team: $TEAM"
+
+        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' build/ios-swiftui/Info.plist)
+        xcodebuild -project "$XCPROJ" \
+          -scheme Screenpear \
+          -destination "id=$UDID" \
+          -allowProvisioningUpdates \
+          build
+
+        APP_PATH=$(xcodebuild -project "$XCPROJ" \
+          -scheme Screenpear \
+          -destination "id=$UDID" \
+          -allowProvisioningUpdates \
+          -showBuildSettings 2>/dev/null | sed -n 's/^ *BUILT_PRODUCTS_DIR = //p' | head -1)
+        APP_PATH="$APP_PATH/Screenpear.app"
+
+        echo "Installing $BUNDLE_ID on $UDID"
+        xcrun devicectl device install app --device "$UDID" "$APP_PATH"
+        xcrun devicectl device process launch --device "$UDID" --terminate-existing "$BUNDLE_ID"
+
+  xcode:
+    summary: |
+      Generate an Xcode project for this lane and open it.
+
+      The lane builds with bare swiftc, so there is no checked-in project;
+      build/ios-swiftui/xcode/gen.py writes Screenpear.xcodeproj (gitignored)
+      with one app target over the same sources, Info.plist and asset
+      catalog. Use it for debugging, previews, or deploying to a phone with
+      Xcode's automatic signing (DEVELOPMENT_TEAM is prefilled from
+      .ios-device.env when present).
+    platforms: [darwin]
+    cmds:
+      # Team id: TEAM_ID (env or .ios-device.env), else the OU of the first
+      # Apple Development certificate in the keychain, else left for Xcode.
+      - |
+        TEAM="{{.TEAM_ID}}"
+        if [ -z "$TEAM" ]; then
+          TEAM=$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+            | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU *= *\([A-Z0-9]\{10\}\).*/\1/p' | head -1)
+        fi
+        python3 build/ios-swiftui/xcode/gen.py --team "$TEAM"
+      - open build/ios-swiftui/xcode/Screenpear.xcodeproj
+
+  devices:
+    summary: List connected iOS devices (UDIDs) for ios:device
+    platforms: [darwin]
+    cmds:
+      - xcrun xcdevice list | grep -E '"(name|identifier|operatingSystemVersion)"' || xcrun devicectl list devices
+
+  device:
+    summary: |
+      Build for a physical iPhone, sign with a real identity and provisioning
+      profile, install and launch over devicectl (Xcode 15+, phone on USB or
+      the same Wi-Fi, Developer Mode on).
+
+      One-time setup: in Xcode create any throwaway app with bundle id
+      com.automationd.screenpear and your team, run it once on the phone, then
+      download the "iOS Team Provisioning Profile: com.automationd.screenpear"
+      from Xcode > Settings > Accounts > Download Manual Profiles; it lands in
+      ~/Library/Developer/Xcode/UserData/Provisioning Profiles/ (pass it as
+      PROFILE). Entitlements are derived from that profile here, so the bundle
+      id and team id inside it must match.
+
+        task ios:device UDID=<from ios:devices> TEAM_ID=ABCDE12345 \
+             CODESIGN_IDENTITY="Apple Development: Dmitry Kireev (XXXXXXXXXX)" \
+             PROFILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/<uuid>.mobileprovision"
+
+      Free Apple IDs work (7-day profile); the app shows as untrusted until
+      Settings > General > VPN & Device Management > trust the developer.
+    platforms: [darwin]
+    vars:
+      # Recomputed here: the file-level SDK/TARGET were derived from the
+      # default platform (simulator) before this task's override existed.
+      SWIFTUI_IOS_PLATFORM: device
+      SWIFTUI_IOS_SDK: iphoneos
+      SWIFTUI_IOS_TARGET: 'arm64-apple-ios{{.SWIFTUI_MIN_IOS}}'
+    preconditions:
+      - sh: test -n "{{.UDID}}"
+        msg: "Set UDID (see: task ios:devices)"
+      - sh: test -n "{{.TEAM_ID}}"
+        msg: "Set TEAM_ID (10-char Apple team id)"
+      - sh: test -n "{{.PROFILE}}" && test -f "{{.PROFILE}}"
+        msg: "Set PROFILE to a .mobileprovision for com.automationd.screenpear"
+      - sh: test "{{.CODESIGN_IDENTITY}}" != "-"
+        msg: 'Set CODESIGN_IDENTITY="Apple Development: …" (see: security find-identity -v -p codesigning)'
+      - sh: xcrun -f devicectl
+        msg: "devicectl not found: Xcode 15+ is required"
+    cmds:
+      - task: bundle
+        vars:
+          SWIFTUI_IOS_PLATFORM: device
+          SWIFTUI_IOS_SDK: iphoneos
+          SWIFTUI_IOS_TARGET: 'arm64-apple-ios{{.SWIFTUI_MIN_IOS}}'
+          CODESIGN_IDENTITY: '{{.CODESIGN_IDENTITY}}'
+      - |
+        set -euo pipefail
+        APP="{{.SWIFTUI_IOS_APP}}"
+        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+        cp "{{.PROFILE}}" "$APP/embedded.mobileprovision"
+        # Entitlements must match the profile or installd rejects the app.
+        ENT=$(mktemp -t screenpear-ent).plist
+        cat > "$ENT" <<EOT
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+          <key>application-identifier</key><string>{{.TEAM_ID}}.$BUNDLE_ID</string>
+          <key>com.apple.developer.team-identifier</key><string>{{.TEAM_ID}}</string>
+          <key>get-task-allow</key><true/>
+        </dict></plist>
+        EOT
+        codesign --force --sign "{{.CODESIGN_IDENTITY}}" --entitlements "$ENT" "$APP"
+        rm -f "$ENT"
+        echo "Installing $BUNDLE_ID on {{.UDID}}"
+        xcrun devicectl device install app --device "{{.UDID}}" "$APP"
+        xcrun devicectl device process launch --device "{{.UDID}}" --terminate-existing "$BUNDLE_ID"
+
+  logs:
+    summary: Stream simulator logs for the app
+    platforms: [darwin]
+    cmds:
+      - xcrun simctl spawn booted log stream --level debug --style compact --predicate 'process == "{{.SWIFTUI_IOS_BIN}}"'
+
+  screenshot:
+    summary: Capture a screenshot from the booted iOS Simulator
+    platforms: [darwin]
+    vars:
+      DIR: '.scratch/screenshots/ios'
+      OUT: '{{.OUT | default (printf "%s/screenshot-%s.png" .DIR (now | date "20060102-150405"))}}'
+    cmds:
+      - mkdir -p {{.DIR}}
+      - xcrun simctl io booted screenshot "{{.OUT}}"
+      - echo "Saved to {{.OUT}}"
+
+  rebuild:
+    summary: Rebuild and reinstall on the booted simulator (used by the dev file watcher)
+    internal: true
+    platforms: [darwin]
+    cmds:
+      - task: bundle
+      - |
+        APP="{{.SWIFTUI_IOS_APP}}"
+        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+        xcrun simctl terminate booted "$BUNDLE_ID" 2>/dev/null || true
+        xcrun simctl install booted "$APP"
+        xcrun simctl launch booted "$BUNDLE_ID"
+        echo "Reinstalled $APP"
+
+  wda:setup:
+    summary: Clone and build WebDriverAgent for iOS Simulator
+    platforms: [darwin]
+    cmds:
+      - |
+        if [ ! -d "build/wda/WebDriverAgent" ]; then
+          echo "Cloning WebDriverAgent..."
+          mkdir -p build/wda
+          git clone --depth 1 https://github.com/appium/WebDriverAgent.git build/wda/WebDriverAgent
+        fi
+      - |
+        echo "Building WebDriverAgent..."
+        xcodebuild build-for-testing \
+          -project build/wda/WebDriverAgent/WebDriverAgent.xcodeproj \
+          -scheme WebDriverAgentRunner \
+          -sdk iphonesimulator \
+          -destination 'generic/platform=iOS Simulator' \
+          -derivedDataPath build/wda/derived \
+          CODE_SIGNING_ALLOWED=NO \
+          IPHONEOS_DEPLOYMENT_TARGET={{.SWIFTUI_MIN_IOS}} \
+          ONLY_ACTIVE_ARCH=YES
+    status:
+      - test -d build/wda/derived/Build/Products/Debug-iphonesimulator/WebDriverAgentRunner-Runner.app
+
+  wda:install:
+    summary: Install WebDriverAgent on booted iOS Simulator
+    platforms: [darwin]
+    deps:
+      - task: ensure-simulator
+      - task: wda:setup
+    cmds:
+      - |
+        WDA_APP=$(find build/wda/derived/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
+        if [ -z "$WDA_APP" ]; then
+          echo "WebDriverAgent not built. Run: task ios:wda:setup"
+          exit 1
+        fi
+        xcrun simctl install booted "$WDA_APP"
+        echo "WebDriverAgent installed on simulator"
+
+  wda:start:
+    summary: Launch WebDriverAgent on iOS Simulator via xcodebuild test-without-building
+    platforms: [darwin]
+    deps:
+      - task: wda:setup
+    cmds:
+      - |
+        BOOTED_UDID=$(xcrun simctl list devices booted -j | python3 -c "import sys,json; devs=[d for r in json.load(sys.stdin)['devices'].values() for d in r if d['state']=='Booted']; print(devs[0]['udid'])" 2>/dev/null)
+        if [ -z "$BOOTED_UDID" ]; then
+          echo "No booted simulator found"
+          exit 1
+        fi
+        mkdir -p .scratch/debug
+        rm -f .scratch/debug/wda.log .scratch/debug/wda.url
+        echo "Starting WDA on simulator $BOOTED_UDID..."
+        nohup xcodebuild test-without-building \
+          -project build/wda/WebDriverAgent/WebDriverAgent.xcodeproj \
+          -scheme WebDriverAgentRunner \
+          -destination "id=$BOOTED_UDID" \
+          -derivedDataPath build/wda/derived \
+          CODE_SIGNING_ALLOWED=NO \
+          > .scratch/debug/wda.log 2>&1 &
+        echo "Waiting for WDA to be ready..."
+        for i in $(seq 1 60); do
+          WDA_LINE=$(grep -o 'ServerURLHere->http://[^<]*' .scratch/debug/wda.log 2>/dev/null | head -1)
+          if [ -n "$WDA_LINE" ]; then
+            WDA_URL=$(echo "$WDA_LINE" | sed 's/ServerURLHere->//')
+            if curl -s "$WDA_URL/status" > /dev/null 2>&1; then
+              echo "WDA is ready at $WDA_URL"
+              echo "$WDA_URL" > .scratch/debug/wda.url
+              exit 0
+            fi
+          fi
+          sleep 1
+        done
+        echo "WDA failed to start after 60s. Check .scratch/debug/wda.log"
+        exit 1
+
+  wda:stop:
+    summary: Stop WebDriverAgent on iOS Simulator
+    platforms: [darwin]
+    cmds:
+      - |
+        pkill -f 'xcodebuild.*WebDriverAgentRunner' 2>/dev/null || true
+        xcrun simctl terminate booted com.facebook.WebDriverAgentRunner.xctrunner 2>/dev/null || true
+
+  test:
+    summary: Run Go-driven UI tests via WebDriverAgent (assumes app installed + WDA running)
+    platforms: [darwin]
+    cmds:
+      - |
+        WDA_URL="http://localhost:8100"
+        if [ -f .scratch/debug/wda.url ]; then
+          WDA_URL=$(cat .scratch/debug/wda.url)
+        fi
+        echo "Running Go UI tests against $WDA_URL..."
+        WDA_URL="$WDA_URL" go test ./test/e2e/ -v -count=1 -timeout 120s -run TestIOS 2>&1
+
+  test:ui:
+    summary: Build app, deploy to simulator, start WDA, run Go UI tests, stop WDA
+    platforms: [darwin]
+    cmds:
+      - task: dev
+      - task: wda:start
+      - |
+        WDA_URL="http://localhost:8100"
+        if [ -f .scratch/debug/wda.url ]; then
+          WDA_URL=$(cat .scratch/debug/wda.url)
+        fi
+        echo "Running Go UI tests against $WDA_URL..."
+        WDA_URL="$WDA_URL" go test ./test/e2e/ -v -count=1 -timeout 120s -run TestIOS 2>&1
+      - task: wda:stop
+
+  dev:watch:
+    summary: Build app, install on simulator, start WDA, watch for changes and auto-rebuild
+    platforms: [darwin]
+    deps:
+      - task: wda:setup
+    cmds:
+      - task: dev
+      - |
+        BOOTED_UDID=$(xcrun simctl list devices booted -j | python3 -c "import sys,json; devs=[d for r in json.load(sys.stdin)['devices'].values() for d in r if d['state']=='Booted']; print(devs[0]['udid'])" 2>/dev/null)
+        if [ -z "$BOOTED_UDID" ]; then
+          echo "No booted simulator found"
+          exit 1
+        fi
+        pkill -f 'xcodebuild.*WebDriverAgentRunner' 2>/dev/null || true
+        xcrun simctl terminate booted com.facebook.WebDriverAgentRunner.xctrunner 2>/dev/null || true
+        sleep 1
+        LOCK="/tmp/screenpear-rebuild.lock"
+        rm -f "$LOCK"
+        echo "Starting file watcher (Swift, JSON)..."
+        WATCHER_LOG=".scratch/debug/watcher.log"
+        mkdir -p .scratch/debug
+        (
+          exec >> "$WATCHER_LOG" 2>&1
+          echo "=== watcher subshell started at $(date) ==="
+          do_rebuild() {
+            if [ -f "$LOCK" ]; then return; fi
+            touch "$LOCK"
+            echo "==> Change detected ($1), rebuilding... ($(date +%H:%M:%S))"
+            if task ios:rebuild 2>&1; then
+              echo "==> Rebuild OK ($(date +%H:%M:%S))"
+            else
+              echo "==> Rebuild FAILED ($(date +%H:%M:%S))"
+            fi
+            rm -f "$LOCK"
+          }
+          if command -v fswatch > /dev/null 2>&1; then
+            PROJECT_ROOT="$(pwd)"
+            fswatch -r -l 2 \
+              --event Created --event Updated --event Renamed --event Removed \
+              --exclude '/build/wda/' --exclude '/bin/' \
+              --exclude '/frontend/' --exclude '\.scratch/' --exclude '/\.git/' --exclude '/test/results/' \
+              --include '\.swift$' --include '\.plist$' --include '\.json$' \
+              --exclude '.*' \
+              "$PROJECT_ROOT/build/ios-swiftui" "$PROJECT_ROOT/build/swift-shared" | while read -r file; do
+                rel="${file#$PROJECT_ROOT/}"
+                echo "[watcher] fswatch event: $rel"
+                do_rebuild "$rel"
+            done
+          else
+            PROJECT_ROOT="$(pwd)"
+            while true; do
+              sleep 3
+              CHANGED=$(find "$PROJECT_ROOT/build/ios-swiftui" "$PROJECT_ROOT/build/swift-shared" \
+                \( -name '*.swift' -o -name '*.plist' -o -name '*.json' \) \
+                -newer "{{.SWIFTUI_IOS_APP}}/Info.plist" 2>/dev/null | head -1)
+              if [ -n "$CHANGED" ]; then
+                do_rebuild "$CHANGED"
+              fi
+            done
+          fi
+        ) &
+        WATCHER_PID=$!
+        echo "Starting WDA on simulator $BOOTED_UDID (foreground)..."
+        echo "File watcher running — edits to .swift/.plist/.json trigger auto-rebuild."
+        echo "Run tests from another terminal: WDA_URL=http://<host-ip>:8100 go test ./test/e2e/ -v -run TestIOS"
+        echo "Press Ctrl+C to stop."
+        xcodebuild test-without-building \
+          -project build/wda/WebDriverAgent/WebDriverAgent.xcodeproj \
+          -scheme WebDriverAgentRunner \
+          -destination "id=$BOOTED_UDID" \
+          -derivedDataPath build/wda/derived \
+          CODE_SIGNING_ALLOWED=NO
+
+  clean:
+    cmds:
+      - rm -rf "{{.SWIFTUI_IOS_APP}}" "{{.BIN_DIR}}/{{.SWIFTUI_IOS_BIN}}" build/wda

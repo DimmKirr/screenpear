@@ -1,104 +1,148 @@
-/*
- * Copyright 2025 Dmitry Kireev <dmitry@atd.sh>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+// Screenpear: mask sensitive text in screenshots.
+//
+// Wails 3 shell. The OCR and masking live in services/ and are reached two
+// ways: the webview (Linux, Windows) calls the generated bindings, and the
+// native SwiftUI window (macOS, build/macos-swiftui) calls the loopback HTTP
+// API. Both talk to the same OCRService, so results are identical.
+//
+// Dev:     task dev
+// Build:   task build            -> bin/screenpear
+// Package: task package          -> platform bundle/installer
 package main
 
 import (
-	"fmt"
-	"github.com/progrium/darwinkit/macos/appkit"
-	"github.com/progrium/darwinkit/macos/foundation"
-	"github.com/progrium/darwinkit/macos/vision"
+	"embed"
 	"log"
+	"log/slog"
+	"net/http"
+	"os"
 	"strings"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"github.com/automationd/screenpear/services"
 )
 
-func recognizeText(imagePath string) string {
-	// Load image as NSImage
-	nsImage := appkit.NSImage_Alloc().InitWithContentsOfFile(core.String(imagePath))
-	if nsImage.ID == 0 {
-		log.Fatal("Failed to load image.")
-		return ""
-	}
+// The built web app is embedded into the binary. `task common:build:frontend`
+// populates frontend/dist from the Vite build.
+//
+//go:embed all:frontend/dist
+var assets embed.FS
 
-	// Convert NSImage to CGImage
-	imageData := nsImage.TIFFRepresentation()
-	bitmap := appkit.NSBitmapImageRep_Alloc().InitWithData(imageData)
-	if bitmap.ID == 0 {
-		log.Fatal("Failed to create bitmap representation.")
-		return ""
-	}
+const (
+	appName       = "Screenpear"
+	appIdentifier = "com.automationd.screenpear"
+	// eventOpen carries an absolute image path to the webview.
+	eventOpen = "open"
+)
 
-	cgImage := bitmap.CGImage()
-	if cgImage.ID == 0 {
-		log.Fatal("Failed to convert NSImage to CGImage.")
-		return ""
-	}
-
-	// Create VNImageRequestHandler with CGImage
-	handler := vision.VNImageRequestHandler_Alloc().InitWithCGImageOptions(cgImage, foundation.NSDictionary{})
-	if handler.ID == 0 {
-		log.Fatal("Failed to create VNImageRequestHandler.")
-		return ""
-	}
-
-	// Create text recognition request
-	request := vision.VNRecognizeTextRequest_Alloc().Init()
-	if request.ID == 0 {
-		log.Fatal("Failed to create VNRecognizeTextRequest.")
-		return ""
-	}
-
-	// Set recognition level to accurate
-	request.SetRecognitionLevel(vision.VNRequestTextRecognitionLevelAccurate)
-
-	// Perform OCR request
-	success, err := handler.PerformRequestsError([]foundation.NSObject{request})
-	if !success {
-		log.Fatalf("OCR request failed: %v", err)
-		return ""
-	}
-
-	// Extract recognized text
-	var extractedText []string
-	results := request.Results()
-	if results.ID == 0 {
-		log.Fatal("No OCR results found.")
-		return ""
-	}
-
-	for _, obsObj := range results.Objects() {
-		observation := vision.VNRecognizedTextObservation{NSObject: obsObj}
-		topCandidates := observation.TopCandidates(1).Objects()
-
-		if len(topCandidates) > 0 {
-			text := vision.VNRecognizedText{NSObject: topCandidates[0]}.String()
-			extractedText = append(extractedText, text)
-		}
-	}
-
-	// Return extracted text
-	return strings.Join(extractedText, "\n")
+func init() {
+	// Registered so the binding generator types the event for the frontend.
+	application.RegisterEvent[string](eventOpen)
 }
 
+// Injected at link time by the Taskfile: -X main.version=<RFC3339>-<sha>.
+// The default keeps `go build ./...` and `go test` working without flags.
+var version = "dev"
+
 func main() {
-	imagePath := "/Users/dmitry/dev/automationd/lab.atd.sh/screenpear/data/input/digitalocean-01-input.jpg"
-	text := recognizeText(imagePath)
-	if text == "" {
-		fmt.Println("No text detected.")
-	} else {
-		fmt.Println("Recognized Text:\n", text)
+	logger := debugLogger()
+
+	ocr := services.NewOCRService(services.DefaultOptions(), logger)
+
+	api := services.NewAPI(ocr, appIdentifier, version)
+	apiBase, err := api.Start()
+	if err != nil {
+		log.Fatalf("api: %v", err)
+	}
+	defer api.Close()
+	api.WritePortFile()
+	log.Printf("api: %s (port file written for companions)", apiBase)
+
+	shell := NewShellService()
+
+	options := application.Options{
+		Name:        appName,
+		Description: "Mask sensitive text in screenshots",
+		Icon:        appIcon,
+		Services: []application.Service{
+			application.NewService(ocr),
+			application.NewService(shell),
+		},
+		Assets: application.AssetOptions{
+			Handler:    application.AssetFileServerFS(assets),
+			Middleware: apiMiddleware(api.Handler()),
+		},
+		SingleInstance: singleInstanceOptions(),
+		Mac: application.MacOptions{
+			// Tray app: closing the window keeps the process alive.
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
+		},
+		Windows: application.WindowsOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
+	}
+	if logger != nil {
+		options.Logger = logger
+		options.LogLevel = slog.LevelDebug
+	}
+	applyPlatformAppOptions(&options)
+
+	app := application.New(options)
+
+	installAppMenu(app)
+	window := newMainWindow(app, api.Port())
+	installSystemTray(app, window)
+
+	// POST /api/open -> the webview loads the file. The SwiftUI window polls
+	// nothing: on macOS the helper owns its own open flow.
+	api.OnOpen = func(path string) {
+		app.Event.Emit(eventOpen, path)
+		window.Show()
+	}
+
+	if err := app.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// apiMiddleware mounts the loopback API inside the webview's asset server so
+// the page can use "/api/image?path=..." for previews without knowing the
+// port. Everything else falls through to the embedded frontend.
+func apiMiddleware(api http.Handler) application.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				api.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// debugLogger returns Wails' system logger at debug level when
+// SCREENPEAR_DEBUG is set, and nil otherwise (Wails' default: info to stdout).
+func debugLogger() *slog.Logger {
+	if os.Getenv("SCREENPEAR_DEBUG") == "" {
+		return nil
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// singleInstanceOptions returns the lock config when D-Bus is available
+// (normal desktop), and nil in containers / headless CI where the session
+// bus is absent and the lock would crash the app on startup.
+func singleInstanceOptions() *application.SingleInstanceOptions {
+	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
+		return nil
+	}
+	return &application.SingleInstanceOptions{
+		UniqueID: appIdentifier,
+		OnSecondInstanceLaunch: func(_ application.SecondInstanceData) {
+			if w := currentMainWindow(); w != nil {
+				w.Show()
+			}
+		},
 	}
 }

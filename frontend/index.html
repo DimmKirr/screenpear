@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <link rel="stylesheet" href="/style.css"/>
+    <title>Screenpear</title>
+</head>
+<body>
+<div class="chrome" data-drag>
+    <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Screenpear</span>
+    </div>
+    <div class="toolbar">
+        <button id="open" class="btn btn-primary">Open image…</button>
+        <button id="analyze" class="btn" disabled>Analyze</button>
+        <button id="mask" class="btn" disabled>Mask</button>
+        <span id="status" class="status" role="status" aria-live="polite">Preparing OCR engine…</span>
+    </div>
+</div>
+
+<main class="layout">
+    <section class="stage" id="stage">
+        <div class="dropzone" id="dropzone">
+            <p class="dropzone-title">Drop a screenshot here</p>
+            <p class="dropzone-sub">or use Open image… — PNG, JPEG or GIF</p>
+        </div>
+        <div class="canvas-wrap hidden" id="canvasWrap">
+            <img id="preview" alt="Loaded screenshot"/>
+            <svg id="overlay" class="overlay" aria-hidden="true"></svg>
+        </div>
+    </section>
+
+    <aside class="panel">
+        <section class="card">
+            <header class="card-head">
+                <h2>Detected text</h2>
+                <span id="lineCount" class="muted">0 lines</span>
+            </header>
+            <ul id="lines" class="lines"></ul>
+        </section>
+        <section class="card">
+            <header class="card-head">
+                <h2>Replacement rules</h2>
+                <span class="muted">one <code>from=to</code> per line</span>
+            </header>
+            <textarea id="rules" class="rules" spellcheck="false"></textarea>
+            <label class="check"><input type="checkbox" id="substituteAll" checked/> Substitute lines no rule matches (same-shape generated text)</label>
+            <label class="check"><input type="checkbox" id="inpaint" checked/> Content-aware background (MI-GAN, 28 MB model on first use)</label>
+        </section>
+        <section class="card" id="resultCard" hidden>
+            <header class="card-head">
+                <h2>Result</h2>
+                <button id="reveal" class="btn btn-small">Reveal</button>
+            </header>
+            <p id="resultPath" class="mono muted"></p>
+            <ul id="replacements" class="lines"></ul>
+        </section>
+    </aside>
+</main>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

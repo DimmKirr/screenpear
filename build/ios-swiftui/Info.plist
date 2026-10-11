@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Screenpear</string>
+    <!-- Must match SWIFTUI_IOS_BIN in build/ios-swiftui/Taskfile.yml. -->
+    <key>CFBundleExecutable</key>
+    <string>screenpear</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.automationd.screenpear</string>
+    <key>CFBundleName</key>
+    <string>Screenpear</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <!-- Must match SWIFTUI_MIN_IOS in the Taskfile: @Observable,
+         ContentUnavailableView and PhotosPicker transferables need 17. -->
+    <key>MinimumOSVersion</key>
+    <string>17.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>(c) 2026, Dmitry Kireev</string>
+    <!-- How images reach the app: "Open in Screenpear" from the share sheet,
+         Files and Photos, with the file copied into our container. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.png</string>
+                <string>public.jpeg</string>
+                <string>com.compuserve.gif</string>
+                <string>public.image</string>
+            </array>
+        </dict>
+    </array>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <false/>
+    <!-- Saving the masked result into the photo library. -->
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Screenpear saves masked screenshots to your photo library.</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>
